@@ -352,7 +352,7 @@ class RMSNorm(nn.Module):
 
     def setup(self) -> None:
         self.weight = self.param(
-            'kernel',
+            'weight',
             nn.initializers.ones,
             (self.dim,),
             self.param_dtype,

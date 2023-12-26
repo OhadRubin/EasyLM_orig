@@ -20,7 +20,7 @@ from EasyLM.jax_utils import (
 )
 from EasyLM.models.llama.llama_model import LLaMAConfig, FlaxLLaMAForCausalLM
 
-
+from transformers import FlaxAutoModelForCausalLM, AutoTokenizer
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
     initialize_jax_distributed=False,
@@ -35,7 +35,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     add_bos_token=True,
     load_llama_config='',
     load_checkpoint='',
-    tokenizer=LLaMAConfig.get_tokenizer_config(),
+    # tokenizer=LLaMAConfig.get_tokenizer_config(),
     lm_server=LMServer.get_default_config(),
     jax_distributed=JaxDistributedConfig.get_default_config(),
 )
@@ -44,20 +44,33 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
     set_random_seed(FLAGS.seed)
-
-    prefix_tokenizer = LLaMAConfig.get_tokenizer(
-        FLAGS.tokenizer, truncation_side='left', padding_side='left'
-    )
-    tokenizer = LLaMAConfig.get_tokenizer(
-        FLAGS.tokenizer, truncation_side='right', padding_side='right'
-    )
+    prefix_tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-chat-hf',
+                                              truncation_side='left', padding_side='left'
+                                              )
+    prefix_tokenizer.pad_token = prefix_tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-chat-hf',
+                                              truncation_side='right', padding_side='right'
+                                              )
+    tokenizer.pad_token = tokenizer.eos_token
+    # prefix_tokenizer = LLaMAConfig.get_tokenizer(
+    #     FLAGS.tokenizer, 
+    # )
+    # tokenizer = LLaMAConfig.get_tokenizer(
+    #     FLAGS.tokenizer, truncation_side='right', padding_side='right'
+    # )
 
     with jax.default_device(jax.devices("cpu")[0]):
         llama_config = LLaMAConfig.load_config(FLAGS.load_llama_config)
-        _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-            FLAGS.load_checkpoint, disallow_trainstate=True
-        )
-
+        # _, params = StreamingCheckpointer.load_trainstate_checkpoint(
+        #     FLAGS.load_checkpoint, disallow_trainstate=True
+        # )
+        params = FlaxAutoModelForCausalLM.from_pretrained('meta-llama/Llama-2-7b-chat-hf',
+                                                          from_pt=True,
+                                                     dtype=jnp.bfloat16,
+                                                     ).params
+        params = {"params": params}
+        
+        
         hf_model = FlaxLLaMAForCausalLM(
             llama_config,
             input_shape=(1, FLAGS.seq_length),

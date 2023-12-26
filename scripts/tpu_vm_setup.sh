@@ -40,7 +40,7 @@ sentencepiece
 pydantic
 fastapi
 uvicorn
-gradio
+gradio==3.50.2
 EndOfFile
 
 pip install --upgrade -r $HOME/tpu_requirements.txt
