@@ -35,8 +35,29 @@ from EasyLM.jax_utils import (
     with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
 )
 
+from transformers import AutoTokenizer
+def dense_init(config,is_embedding=False):
+    if config.palm_init:
+        if is_embedding:
+            return jax.nn.initializers.normal(stddev=1.0)
+        return jax.nn.initializers.variance_scaling(config.initializer_range, 'fan_in', 'normal', out_axis=0)
+    else:
+        return jax.nn.initializers.normal(stddev=config.initializer_range)
+
 
 LLAMA_STANDARD_CONFIGS = {
+    '250m': {
+        'vocab_size': 32000,
+        'hidden_size': 1024,
+        'intermediate_size': 2816,
+        'num_hidden_layers': 14,
+        'num_attention_heads': 16,
+        'max_sequence_length': 2048,
+        'initializer_range': 0.02,
+        'rms_norm_eps': 1e-6,
+        'use_cache': True,
+        'tie_word_embeddings': False,
+    },
     '1b': {
         'vocab_size': 32000,
         'hidden_size': 2048,
@@ -192,10 +213,12 @@ class LLaMAConfig(PretrainedConfig):
         scan_attention=False,
         scan_mlp=False,
         scan_query_chunk_size=1024,
-        scan_key_chunk_size=1024,
+        scan_key_chunk_size=2048,
         scan_mlp_chunk_size=1024,
         fcm_min_ratio=0.0,
         fcm_max_ratio=0.0,
+        palm_init=False,
+        rms_one_baseline=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -220,8 +243,9 @@ class LLaMAConfig(PretrainedConfig):
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
+        self.palm_init=palm_init
+        self.rms_one_baseline=rms_one_baseline
         super().__init__(
-            # pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
@@ -250,19 +274,19 @@ class LLaMAConfig(PretrainedConfig):
         """
         return (
             # embeddings
-            ("transformer/wte/embedding", PS("mp", "fsdp")),
+            ("model/embed_tokens/embedding", PS("mp", "fsdp")),
             # atention
-            ("attention/(wq|wk|wv)/kernel", PS("fsdp", "mp")),
-            ("attention/wo/kernel", PS("mp", "fsdp")),
+            ("self_attn/(q_proj|k_proj|v_proj)/kernel", PS("fsdp", "mp")),
+            ("self_attn/o_proj/kernel", PS("mp", "fsdp")),
             # mlp
-            ("feed_forward/w1/kernel", PS("fsdp", "mp")),
-            ("feed_forward/w2/kernel", PS("mp", "fsdp")),
-            ("feed_forward/w3/kernel", PS("fsdp", "mp")),
+            ("mlp/up_proj/kernel", PS("fsdp", "mp")),
+            ("mlp/down_proj/kernel", PS("mp", "fsdp")),
+            ("mlp/gate_proj/kernel", PS("fsdp", "mp")),
             # layer norms
-            ("attention_norm/kernel", PS(None)),
-            ("ffn_norm/kernel", PS(None)),
+            ("input_layernorm/kernel", PS(None)),
+            ("post_attention_layernorm/kernel", PS(None)),
             # output head
-            ("transformer/ln_f/kernel", PS(None)),
+            ("transformer/norm/kernel", PS(None)),
             ("lm_head/kernel", PS("fsdp", "mp")),
             ('.*', PS(None)),
         )
@@ -320,6 +344,7 @@ logger = logging.get_logger(__name__)
 
 
 class RMSNorm(nn.Module):
+    config: LLaMAConfig
     dim: int
     eps: float=1e-6
     dtype: jnp.dtype=jnp.float32
@@ -387,36 +412,36 @@ class FlaxLLaMAAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
 
-        self.wq = nn.Dense(
+        self.q_proj = nn.Dense(
             config.num_attention_heads*self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
-        self.wk = nn.Dense(
+        self.k_proj = nn.Dense(
             config.num_attention_heads*self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
-        self.wv = nn.Dense(
+        self.v_proj = nn.Dense(
             config.num_attention_heads*self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
-        self.wo = nn.Dense(
+        self.o_proj = nn.Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
 
@@ -478,7 +503,7 @@ class FlaxLLaMAAttention(nn.Module):
         output_attentions: bool = False,
         fcm_mask=None,
     ):
-        xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
+        xq, xk, xv = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
 
         xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "mp"))
         xk = with_sharding_constraint(xk, PS(("dp", "fsdp"), None, "mp"))
@@ -569,7 +594,7 @@ class FlaxLLaMAAttention(nn.Module):
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
 
         attn_output = self._merge_heads(attn_output)
-        attn_output = self.wo(attn_output)
+        attn_output = self.o_proj(attn_output)
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
@@ -584,34 +609,34 @@ class FlaxLLaMAMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.w1 = nn.Dense(
+        self.up_proj = nn.Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
-        self.w2 = nn.Dense(
+        self.down_proj = nn.Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
-        self.w3 = nn.Dense(
+        self.gate_proj = nn.Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        x = self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        x = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
         x = self.dropout(x, deterministic=deterministic)
         return x
 
@@ -628,35 +653,33 @@ class FlaxLLaMABlock(nn.Module):
         if self.config.remat_attention != '':
             attention_module = remat(
                 FlaxLLaMAAttention, static_argnums=(3, 4, 5),
-                policy=get_gradient_checkpoint_policy(self.config.remat_attention),
-                prevent_cse=True,
+                policy=get_gradient_checkpoint_policy(self.config.remat_attention)
             )
         if self.config.remat_mlp != '':
             mlp_module = remat(
                 FlaxLLaMAMLP, static_argnums=(1,),
-                policy=get_gradient_checkpoint_policy(self.config.remat_mlp),
-                prevent_cse=True,
+                policy=get_gradient_checkpoint_policy(self.config.remat_mlp)
             )
 
-        self.attention = attention_module(
+        self.self_attn = attention_module(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.feed_forward = mlp_module(
+        self.mlp = mlp_module(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.attention_norm = RMSNorm(
+        self.input_layernorm = RMSNorm(self.config,
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.ffn_norm = RMSNorm(
+        self.post_attention_layernorm = RMSNorm(self.config,
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
@@ -673,8 +696,8 @@ class FlaxLLaMABlock(nn.Module):
         output_attentions: bool = False,
         fcm_mask: Optional[jnp.ndarray] = None,
     ):
-        attn_outputs = self.attention(
-            self.attention_norm(hidden_states),
+        attn_outputs = self.self_attn(
+            self.input_layernorm(hidden_states),
             attention_mask,
             position_ids,
             deterministic,
@@ -685,21 +708,20 @@ class FlaxLLaMABlock(nn.Module):
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
 
-        feed_forward_input = self.ffn_norm(hidden_states)
+        feed_forward_input = self.post_attention_layernorm(hidden_states)
 
         if self.config.scan_mlp:
             feed_forward_hidden_states = blockwise_ffn(
-                self.feed_forward,
+                self.mlp,
                 feed_forward_input,
                 self.config.scan_mlp_chunk_size,
                 deterministic,
             )
         else:
-            feed_forward_hidden_states = self.feed_forward(
+            feed_forward_hidden_states = self.mlp(
                 feed_forward_input,
                 deterministic,
             )
-        feed_forward_hidden_states = with_sharding_constraint(feed_forward_hidden_states, PS(("dp", "fsdp"), None, "mp"))
 
         hidden_states = hidden_states + feed_forward_hidden_states
 
@@ -866,7 +888,7 @@ class FlaxLLaMABlockCollection(nn.Module):
                 FlaxLLaMABlock, static_argnums=(3, 4, 5),
                 policy=get_gradient_checkpoint_policy(self.config.remat_block)
             )
-        self.blocks = [
+        self.layers = [
             block(
                 self.config,
                 name=str(i),
@@ -907,7 +929,7 @@ class FlaxLLaMABlockCollection(nn.Module):
         else:
             fcm_mask = None
 
-        for block in self.blocks:
+        for block in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -940,16 +962,16 @@ class FlaxLLaMAModule(nn.Module):
     def setup(self):
         self.embed_dim = self.config.hidden_size
 
-        self.wte = nn.Embed(
+        self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            embedding_init=dense_init(self.config, is_embedding=True),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
-        self.h = FlaxLLaMABlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
-        self.ln_f = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.layers = FlaxLLaMABlockCollection(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
+        self.norm = RMSNorm(self.config,self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=self.dtype, param_dtype=self.param_dtype)
 
     def __call__(
         self,
@@ -962,11 +984,11 @@ class FlaxLLaMAModule(nn.Module):
         output_hidden_states: bool = False,
         return_dict: bool = True,
     ):
-        input_embeds = self.wte(input_ids.astype("i4"))
+        input_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
-        outputs = self.h(
+        outputs = self.layers(
             hidden_states,
             attention_mask,
             position_ids=position_ids,
@@ -978,7 +1000,7 @@ class FlaxLLaMAModule(nn.Module):
         )
 
         hidden_states = outputs[0]
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
             all_hidden_states = outputs[1] + (hidden_states,)
@@ -1007,6 +1029,18 @@ class FlaxLLaMAModel(FlaxLLaMAPreTrainedModel):
 #     _CONFIG_FOR_DOC,
 # )
 
+
+
+# see https://www.semanticscholar.org/reader/4025d3b39a8173af1f92662be289aea1ea9d6196
+def init_bias_(key,
+        shape,
+        dtype):
+    with open("bias.npy","r") as f:
+        array = np.load(f)
+    assert shape==array.shape
+    return jnp.array(array).astype(dtype)
+
+
 class FlaxLLaMAForCausalLMModule(nn.Module):
     config: LLaMAConfig
     dtype: jnp.dtype = jnp.float32
@@ -1014,7 +1048,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
-        self.transformer = FlaxLLaMAModule(self.config, dtype=self.dtype)
+        self.model = FlaxLLaMAModule(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
@@ -1043,7 +1077,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length)
             )
-        outputs = self.transformer(
+        outputs = self.model(
             input_ids,
             attention_mask,
             position_ids,
@@ -1055,12 +1089,13 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
         )
 
         hidden_states = outputs[0]
-
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
+            shared_kernel = self.model.variables["params"]["embed_tokens"]["embedding"].T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
         else:
             lm_logits = self.lm_head(hidden_states)
+        if self.config.palm_init:
+            lm_logits = lm_logits/jnp.sqrt(hidden_states.shape[-1])
 
         if not return_dict:
             return (lm_logits,) + outputs[1:]
@@ -1137,11 +1172,11 @@ class LLaMATokenizer(PreTrainedTokenizer):
         **kwargs,
     ):
         self.sp_model_kwargs = {} if sp_model_kwargs is None else sp_model_kwargs
+        self.sp_model = spm.SentencePieceProcessor(**self.sp_model_kwargs)
         super().__init__(bos_token=bos_token, eos_token=eos_token, unk_token=unk_token, **kwargs)
         self.vocab_file = vocab_file
         self.add_bos_token = add_bos_token
         self.add_eos_token = add_eos_token
-        self.sp_model = spm.SentencePieceProcessor(**self.sp_model_kwargs)
 
         with tempfile.NamedTemporaryFile() as tfile:
             with open_file(self.vocab_file, 'rb') as fin:
